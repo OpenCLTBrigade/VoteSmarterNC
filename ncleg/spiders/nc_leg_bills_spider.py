@@ -5,66 +5,64 @@ from urllib.parse import urlparse, parse_qs
 class NcLegBillsSpider(scrapy.Spider):
     # Spider name
     name = "bills"
-    # Bills URL skeleton
-    houseBills = 'https://www.ncleg.net/gascripts/BillLookUp/BillLookUp.pl?BillID=%chamber%%num%&Session=%session%'
-    # Track house and senate bills progression separately
-    houseBillStart = 1
-    senateBillStart = 1
-    # Set the available chambers (House and Senate) for parsing
-    chambers = ['H', 'S']
 
-    def __init__(self, chamber='', session='', number='', *args, **kwargs):
+
+    def __init__(self, chamber='', session='2017', number='', *args, **kwargs):
         super(NcLegBillsSpider, self).__init__(*args, **kwargs)
-        self.chamber = chamber
-        self.session = session
-        self.number = number
 
-    def start_requests(self):
         # Check if parsing single chamber or both
-        if self.chamber in self.chambers:
-            self.chambers = [self.chamber]
+        chamber_prefixes = ['H', 'S']
+        if chamber in chamber_prefixes:
+            self.chambers = [chamber]
+        else:
+            self.chambers = chamber_prefixes
+
+        self.session = session
 
         # Remove all whitespace in number parameter then split commas into array
-        self.number = self.number.replace(" ", "")
-        num_arr = self.number.split(",")
+        bill_numbers = number.replace(" ", "")
+        if bill_numbers:
+            self.billList = bill_numbers.split(",")
+        else:
+            self.billList = None
 
+
+    def start_requests(self):
+        # Bills URL skeleton
         # Bills are numbered predictably so increment bill number += 1
-        for c in self.chambers:
-            if (c == 'H' and self.number == ''):
-                while self.houseBillStart > 0:
-                    yield scrapy.Request(url=self.houseBills.replace('%num%',str(self.houseBillStart)).replace('%chamber%',c).replace('%session%', str(self.session)), callback=self.parse)
-                    self.houseBillStart += 1
+        for chamber in self.chambers:
+            # Start with first bill for each chamber
+            self.isBillsEnd = False
 
-            elif (c == 'H'):
-                for i in range(len(num_arr)):
-                    yield scrapy.Request(url=self.houseBills.replace('%num%',str(num_arr[i])).replace('%chamber%',c).replace('%session%', str(self.session)), callback=self.parse)
+            bills_url = ('https://www.ncleg.net/gascripts/BillLookUp/BillLookUp.pl'
+                              f'?BillID={chamber}{{bill}}&Session={self.session}')
 
-            if (c == 'S' and self.number == ''):
-                while self.senateBillStart > 0:
-                    yield scrapy.Request(url=self.houseBills.replace('%num%',str(self.senateBillStart)).replace('%chamber%',c).replace('%session%', str(self.session)), callback=self.parse)
-                    self.senateBillStart += 1
+            if self.billList:
+                for bill_number in self.billList:
+                    url = bills_url.format(bill=bill_number)
+                    yield scrapy.Request(url=url, callback=self.parse)
+            else:
+                bill_number = 1
+                while not self.isBillsEnd:
+                    url = bills_url.format(bill=bill_number)
+                    yield scrapy.Request(url=url, callback=self.parse)
+                    bill_number += 1
 
-            elif (c == 'S'):
-                for i in range(len(num_arr)):
-                    yield scrapy.Request(url=self.houseBills.replace('%num%',str(num_arr[i])).replace('%chamber%',c).replace('%session%', str(self.session)), callback=self.parse)
-
+ 
     def parse(self, response):
         # Return when we have incremented past the last known bill
         if len(response.xpath('//div[@id = "title"]/text()').re('Not Found')) > 0:
             chamber = parse_qs(urlparse(response.url).query)['BillID'][0][0]
-            if (chamber == 'H'):
-                self.houseBillStart = -1
-            if (chamber == 'S'):
-                self.senateBillStart = -1
+            self.isBillsEnd = True
             return
 
         # Use Bill Item to catch data
         item = Bill()
-        item['number'] = response.xpath('/html/body/div/table/tr/td/table/tr/td[2]').re('\d+')[1]
-        item['chamber'] = response.xpath('/html/body/div/table/tr/td/table/tr/td[2]/text()').re('\w+')[0]
+        item['number'] = response.xpath('//div/table/tr/td/table/tr/td[2]').re('\d+')[1]
+        item['chamber'] = response.xpath('//div/table/tr/td/table/tr/td[2]/text()').re('\w+')[0]
         item['session'] = response.css('.titleSub::text').extract_first()
         item['title'] = response.xpath('//div[@id = "title"]/a/text()').extract_first()
-        item['counties'] = response.xpath('/html/body/div/table/tr/td[1]/table[2]/tr/td[3]/table/tr[4]/td/text()').re('[^,]+')
+        item['counties'] = response.xpath('//div/table/tr/td[1]/table[2]/tr/td[3]/table/tr[4]/td/text()').re('[^,]+')
         item['statutes'] = response.xpath('/html/body/div/table/tr/td[1]/table[2]/tr/td[3]/table/tr[5]/td/div/text()').re('[^\n][^,]+')
         keywords = response.xpath('/html/body/div/table/tr/td[1]/table[2]/tr/td[3]/table/tr[6]/td/div/text()').extract_first().split(', ')
         item['keywords'] = keywords
@@ -81,7 +79,6 @@ class NcLegBillsSpider(scrapy.Spider):
             if ('Passed 3rd Reading' in v[0] and 'Senate' in response.xpath('/html/body/div/table/tr/td[1]/center/table/tr[' + str(i) + ']/td[2]/text()').extract()[0]):
                 item['passed_Senate'] = True
             i = i + 1
-
 
         # Check to see if bill had been ratified. This info is available in bill keywords
         item['is_ratified'] = self.isRatified(keywords)
@@ -105,13 +102,13 @@ class NcLegBillsSpider(scrapy.Spider):
             item['sponsors'] = sponsors
         yield item
 
-    def isRatified(self, arr):
-        if "RATIFIED" in arr:
-            return True
-        return False
+
+    def isRatified(self, bill_keywords):
+        return "RATIFIED" in bill_keywords
+
 
     def isLaw(self, arr):
-        for i in range(len(arr)):
-            if "Law" in arr[i]:
+        for item in arr:
+            if "Law" in item:
                 return True
         return False
